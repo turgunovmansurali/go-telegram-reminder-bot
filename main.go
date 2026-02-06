@@ -130,34 +130,38 @@ func main() {
 		)
 	})
 
-	// ===== CALLBACK: ERTAGA HA =====
-	bot.Handle(&telebot.Callback{Unique: "tomorrow_yes"}, func(c telebot.Context) error {
-		text := c.Callback().Data
+	// ===== CALLBACKLAR (YAGONA, TO‘G‘RI USUL) =====
+	bot.Handle(telebot.OnCallback, func(c telebot.Context) error {
+		switch c.Callback().Unique {
 
-		match := timeRe.FindStringSubmatch(text)
-		if len(match) != 3 {
-			return c.Edit("❌ Vaqtni aniqlab bo‘lmadi")
+		case "tomorrow_yes":
+			text := c.Callback().Data
+
+			match := timeRe.FindStringSubmatch(text)
+			if len(match) != 3 {
+				return c.Edit("❌ Vaqtni aniqlab bo‘lmadi")
+			}
+
+			h, _ := strconv.Atoi(match[1])
+			m, _ := strconv.Atoi(match[2])
+
+			fire := time.Date(
+				time.Now().In(loc).Year(),
+				time.Now().In(loc).Month(),
+				time.Now().In(loc).Day()+1,
+				h, m, 0, 0, loc,
+			)
+
+			task := cleanTask(text, []string{"eslat", "ayt", "yubor"}, nil)
+			saveReminder(c.Chat().ID, task, fire)
+
+			return c.Edit("✅ Eslatma ertangi kunga qo‘shildi")
+
+		case "tomorrow_no":
+			return c.Edit("❎ Eslatma bekor qilindi")
 		}
 
-		h, _ := strconv.Atoi(match[1])
-		m, _ := strconv.Atoi(match[2])
-
-		fire := time.Date(
-			time.Now().In(loc).Year(),
-			time.Now().In(loc).Month(),
-			time.Now().In(loc).Day()+1,
-			h, m, 0, 0, loc,
-		)
-
-		task := cleanTask(text, []string{"eslat", "ayt", "yubor"}, nil)
-		saveReminder(c.Chat().ID, task, fire)
-
-		return c.Edit("✅ Eslatma ertangi kunga qo‘shildi")
-	})
-
-	// ===== CALLBACK: YO‘Q =====
-	bot.Handle(&telebot.Callback{Unique: "tomorrow_no"}, func(c telebot.Context) error {
-		return c.Edit("❎ Eslatma bekor qilindi")
+		return c.Respond()
 	})
 
 	// ===== HTTP (RENDER) =====
