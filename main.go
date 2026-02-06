@@ -24,231 +24,239 @@ type AIResponse struct {
 	Task string `json:"task"`
 }
 
-type PendingConfirm struct {
+type Reminder struct {
+	ID     int
 	ChatID int64
 	Time   string
-	Text   string
+	Task   string
+	FireAt time.Time
 }
 
-var pending = map[int64]PendingConfirm{}
+var (
+	db      *sql.DB
+	timeRe  = regexp.MustCompile(`(?i)(\d{1,2})[:.](\d{2})`)
+	loc, _  = time.LoadLocation("Asia/Tashkent")
+	ctx     = context.Background()
+	menu    = &telebot.ReplyMarkup{}
+	btnList = menu.Text("📋 Kutilayotgan")
+)
 
 func main() {
-	loc, _ := time.LoadLocation("Asia/Tashkent")
-
+	// ==== ENV ====
 	tgToken := os.Getenv("TELEGRAM_APITOKEN")
 	aiKey := os.Getenv("GEMINI_API_KEY")
-
-	if tgToken == "" || aiKey == "" {
-		log.Fatal("Tokenlar topilmadi")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "10000"
 	}
 
-	// === SQLite ===
-	db, err := sql.Open("sqlite3", "bot.db")
+	if tgToken == "" || aiKey == "" {
+		log.Fatal("❌ Tokenlar topilmadi")
+	}
+
+	// ==== SQLITE ====
+	var err error
+	db, err = sql.Open("sqlite3", "./reminders.db")
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
+	initDB()
 
-	db.Exec(`
-	CREATE TABLE IF NOT EXISTS reminders (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		chat_id INTEGER,
-		fire_at INTEGER,
-		task TEXT
-	)`)
-
-	// === Telegram bot ===
-	bot, _ := telebot.NewBot(telebot.Settings{
+	// ==== TELEGRAM BOT ====
+	bot, err := telebot.NewBot(telebot.Settings{
 		Token:  tgToken,
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// === Gemini ===
-	ctx := context.Background()
+	menu.Reply(menu.Row(btnList))
+
+	// ==== GEMINI ====
 	aiClient, _ := genai.NewClient(ctx, option.WithAPIKey(aiKey))
 	defer aiClient.Close()
 	model := aiClient.GenerativeModel("models/gemini-flash-latest")
 
-	// === Tugmalar ===
-	menuConfirm := &telebot.ReplyMarkup{}
-	btnYes := menuConfirm.Data("Ha ✅", "yes")
-	btnNo := menuConfirm.Data("Yo‘q ❌", "no")
-	menuConfirm.Inline(menuConfirm.Row(btnYes, btnNo))
-
-	// === /start ===
+	// ==== START ====
 	bot.Handle("/start", func(c telebot.Context) error {
-		args := c.Args()
-		if len(args) == 1 && strings.HasPrefix(args[0], "del_") {
-			id := strings.TrimPrefix(args[0], "del_")
-			db.Exec("DELETE FROM reminders WHERE id = ? AND chat_id = ?", id, c.Chat().ID)
-			return c.Send("🗑 Eslatma o‘chirildi.")
-		}
-
 		return c.Send(
-			"👋 Salom!\n\nMen ⏰ aqlli eslatma botman.\n\nMisol:\n`12:00 da darsim bor`\n`07:00 da uyg‘onishni eslatib yubor`",
+			"👋 Salom!\n\n"+
+				"Men ⏰ *aqlli eslatma botman*.\n"+
+				"Menga vaqt bilan yozing.\n\n"+
+				"_Masalan:_\n`12:00 da darsim bor`\n`07:00 da menga uyg'onishni eslatib yubor`",
+			menu,
 			telebot.ModeMarkdown,
 		)
 	})
 
-	// === /kutilayotgan ===
+	// ==== KUTILAYOTGAN (tugma + buyruq) ====
+	bot.Handle(&btnList, func(c telebot.Context) error {
+		return showPending(c)
+	})
 	bot.Handle("/kutilayotgan", func(c telebot.Context) error {
-		rows, _ := db.Query(
-			"SELECT id, fire_at, task FROM reminders WHERE chat_id = ? ORDER BY fire_at",
-			c.Chat().ID,
-		)
-		defer rows.Close()
-
-		var out strings.Builder
-		for rows.Next() {
-			var id int
-			var fireAt int64
-			var task string
-			rows.Scan(&id, &fireAt, &task)
-
-			t := time.Unix(fireAt, 0).In(loc).Format("15:04")
-			link := fmt.Sprintf("https://t.me/%s?start=del_%d", bot.Me.Username, id)
-
-			out.WriteString(fmt.Sprintf(
-				"🕒 %s — %s → [o‘chirish](%s)\n",
-				t, task, link,
-			))
-		}
-
-		if out.Len() == 0 {
-			return c.Send("🙂 Sizda hozircha kutilayotgan eslatmalar yo‘q.")
-		}
-
-		return c.Send(
-			"*Kutilayotgan eslatmalar:*\n\n"+out.String(),
-			telebot.ModeMarkdown,
-		)
+		return showPending(c)
 	})
 
-	timeRe := regexp.MustCompile(`(\d{1,2}):(\d{2})`)
-	commands := []string{"eslat", "ayt", "yubor", "bildir"}
+	// ==== ASOSIY HANDLER ====
+	commandWords := []string{"eslat", "ayt", "yubor", "bildir", "xabar"}
 
 	bot.Handle(telebot.OnText, func(c telebot.Context) error {
 		text := strings.ToLower(strings.TrimSpace(c.Text()))
-		m := timeRe.FindStringSubmatch(text)
-		if len(m) != 3 {
-			return c.Send("🙂 Iltimos, vaqtni ham yozing. Masalan: `12:00 da darsim bor`")
+
+		match := timeRe.FindStringSubmatch(text)
+		if len(match) != 3 {
+			return c.Send("🙂 Iltimos, vaqtni ham yozing.", menu)
 		}
 
-		h, _ := strconv.Atoi(m[1])
-		min, _ := strconv.Atoi(m[2])
+		h, _ := strconv.Atoi(match[1])
+		m, _ := strconv.Atoi(match[2])
 
 		now := time.Now().In(loc)
-		fire := time.Date(now.Year(), now.Month(), now.Day(), h, min, 0, 0, loc)
+		fire := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, loc)
 
 		if fire.Before(now) {
-			pending[c.Chat().ID] = PendingConfirm{
-				ChatID: c.Chat().ID,
-				Time:   fmt.Sprintf("%02d:%02d", h, min),
-				Text:   text,
-			}
+			yesNo := &telebot.ReplyMarkup{}
+			btnYes := yesNo.Data("Ha", "tomorrow_yes", text)
+			btnNo := yesNo.Data("Yo‘q", "tomorrow_no")
+			yesNo.Inline(yesNo.Row(btnYes, btnNo))
+
 			return c.Send(
-				"⚠️ Bu vaqt allaqachon o‘tib ketgan.\nErtaga shu vaqtda eslataymi?",
-				menuConfirm,
+				"⚠️ Bu vaqt allaqachon o‘tib ketgan.\n"+
+					"Ertaga shu vaqtda eslataymi?",
+				yesNo,
 			)
 		}
 
-		task := extractTask(text, commands, model, ctx)
+		task := cleanTask(text, commandWords, model, aiKey)
+		saveReminder(c.Chat().ID, task, fire)
 
-		db.Exec(
-			"INSERT INTO reminders(chat_id, fire_at, task) VALUES(?,?,?)",
-			c.Chat().ID,
-			fire.Unix(),
-			task,
-		)
-
-		go schedule(bot, c.Chat().ID, fire, task, db)
-
-		return c.Send(fmt.Sprintf("✅ Eslatma qo‘shildi\n🕒 %02d:%02d\n📝 %s", h, min, task))
+		c.Send(fmt.Sprintf("✅ Eslatma qo‘shildi\n🕒 %02d:%02d\n📝 %s", h, m, task), menu)
+		return nil
 	})
 
-	bot.Handle(&btnYes, func(c telebot.Context) error {
-		p, ok := pending[c.Chat().ID]
-		if !ok {
+	// ==== ERTAGA HA ====
+	bot.Handle(telebot.OnCallback, func(c telebot.Context) error {
+		if c.Callback().Unique() != "tomorrow_yes" {
 			return c.Respond()
 		}
 
-		delete(pending, c.Chat().ID)
-
-		tp := strings.Split(p.Time, ":")
-		h, _ := strconv.Atoi(tp[0])
-		m, _ := strconv.Atoi(tp[1])
+		text := c.Callback().Data
+		match := timeRe.FindStringSubmatch(text)
+		h, _ := strconv.Atoi(match[1])
+		m, _ := strconv.Atoi(match[2])
 
 		now := time.Now().In(loc)
 		fire := time.Date(now.Year(), now.Month(), now.Day()+1, h, m, 0, 0, loc)
 
-		task := extractTask(p.Text, commands, model, ctx)
+		task := cleanTask(text, []string{"eslat", "ayt", "yubor"}, nil, "")
+		saveReminder(c.Chat().ID, task, fire)
 
-		db.Exec(
-			"INSERT INTO reminders(chat_id, fire_at, task) VALUES(?,?,?)",
-			c.Chat().ID,
-			fire.Unix(),
-			task,
-		)
-
-		go schedule(bot, c.Chat().ID, fire, task, db)
-
-		return c.Edit("👍 Yaxshi, ertaga eslataman.")
+		c.Edit("✅ Eslatma ertangi kunga qo‘shildi")
+		return nil
 	})
 
-	bot.Handle(&btnNo, func(c telebot.Context) error {
-		delete(pending, c.Chat().ID)
-		return c.Edit("🙂 Mayli, bekor qilindi.")
-	})
-
-	// === HTTP server (Render uchun) ===
+	// ==== HTTP SERVER (RENDER UCHUN) ====
 	go func() {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
-		}
 		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			w.Write([]byte("OK"))
 		})
+		log.Println("🌐 HTTP server ishga tushdi, port:", port)
 		http.ListenAndServe(":"+port, nil)
 	}()
+
+	// ==== WORKER ====
+	go reminderWorker(bot)
 
 	log.Println("🤖 Bot ishga tushdi")
 	bot.Start()
 }
 
-func extractTask(text string, commands []string, model *genai.GenerativeModel, ctx context.Context) string {
-	for _, c := range commands {
-		if strings.Contains(text, c) {
-			prompt := fmt.Sprintf(
-				`Faqat JSON qaytar: {"task":"qisqa vazifa"}\nMatn: "%s"`,
-				text,
-			)
-			resp, err := model.GenerateContent(ctx, genai.Text(prompt))
-			if err == nil {
-				raw := fmt.Sprint(resp.Candidates[0].Content.Parts[0])
-				raw = strings.Trim(raw, "` \njson")
-				var a AIResponse
-				if json.Unmarshal([]byte(raw), &a) == nil {
-					return a.Task
-				}
-			}
-		}
-	}
-	t := timeRe.ReplaceAllString(text, "")
-	t = strings.ReplaceAll(t, "soat", "")
-	reDa := regexp.MustCompile(`\bda\b`)
-	t = reDa.ReplaceAllString(t, "")
-	return strings.Join(strings.Fields(t), " ")
+// ================= HELPERS =================
+
+func initDB() {
+	db.Exec(`
+	CREATE TABLE IF NOT EXISTS reminders (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		chat_id INTEGER,
+		task TEXT,
+		fire_at DATETIME
+	)
+	`)
 }
 
-func schedule(bot *telebot.Bot, chatID int64, fire time.Time, task string, db *sql.DB) {
-	time.Sleep(time.Until(fire))
-	bot.Send(telebot.ChatID(chatID),
-		fmt.Sprintf("🔔 ESLATMA!\n%s\nsoat %s bo‘ldi",
-			task,
-			time.Now().Format("15:04"),
-		),
-	)
-	db.Exec("DELETE FROM reminders WHERE chat_id = ? AND fire_at = ?", chatID, fire.Unix())
+func saveReminder(chatID int64, task string, fire time.Time) {
+	db.Exec(`INSERT INTO reminders(chat_id, task, fire_at) VALUES(?,?,?)`,
+		chatID, task, fire)
+}
+
+func reminderWorker(bot *telebot.Bot) {
+	for {
+		rows, _ := db.Query(`SELECT id, chat_id, task FROM reminders WHERE fire_at <= ?`,
+			time.Now().In(loc))
+		for rows.Next() {
+			var id int
+			var chatID int64
+			var task string
+			rows.Scan(&id, &chatID, &task)
+
+			bot.Send(telebot.ChatID(chatID),
+				fmt.Sprintf("🔔 *ESLATMA!*\n%s\n_soat %s bo‘ldi_",
+					task, time.Now().Format("15:04")),
+				menu,
+				telebot.ModeMarkdown,
+			)
+			db.Exec(`DELETE FROM reminders WHERE id=?`, id)
+		}
+		time.Sleep(20 * time.Second)
+	}
+}
+
+func showPending(c telebot.Context) error {
+	rows, _ := db.Query(`SELECT id, task, fire_at FROM reminders WHERE chat_id=? ORDER BY fire_at`,
+		c.Chat().ID)
+	defer rows.Close()
+
+	msg := "📋 *Kutilayotgan bildirishnomalar:*\n\n"
+	count := 0
+
+	for rows.Next() {
+		var id int
+		var task string
+		var fire time.Time
+		rows.Scan(&id, &task, &fire)
+
+		msg += fmt.Sprintf("🕒 %s — %s → /ochir_%d\n",
+			fire.Format("15:04"), task, id)
+		count++
+	}
+
+	if count == 0 {
+		return c.Send("🙂 Sizda kutilayotgan xabarlar yo‘q", menu)
+	}
+
+	return c.Send(msg, menu, telebot.ModeMarkdown)
+}
+
+func cleanTask(text string, cmds []string, model *genai.GenerativeModel, key string) string {
+	for _, w := range cmds {
+		if strings.Contains(text, w) && model != nil {
+			prompt := fmt.Sprintf(`JSON qaytar:
+{"task":"qisqa"}
+Matn: "%s"`, text)
+			resp, _ := model.GenerateContent(ctx, genai.Text(prompt))
+			raw := fmt.Sprint(resp.Candidates[0].Content.Parts[0])
+			raw = strings.Trim(raw, "` \njson")
+			var ai AIResponse
+			json.Unmarshal([]byte(raw), &ai)
+			return ai.Task
+		}
+	}
+
+	task := timeRe.ReplaceAllString(text, "")
+	task = strings.ReplaceAll(task, "soat", "")
+	reDa := regexp.MustCompile(`\bda\b`)
+	task = reDa.ReplaceAllString(task, "")
+	return strings.Join(strings.Fields(task), " ")
 }
 
