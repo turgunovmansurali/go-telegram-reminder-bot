@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/generative-ai-go/genai"
+	_ "github.com/mattn/go-sqlite3"
 	"google.golang.org/api/option"
 	"gopkg.in/telebot.v3"
 )
@@ -22,173 +24,231 @@ type AIResponse struct {
 	Task string `json:"task"`
 }
 
+type PendingConfirm struct {
+	ChatID int64
+	Time   string
+	Text   string
+}
+
+var pending = map[int64]PendingConfirm{}
+
 func main() {
-	// === Timezone ===
 	loc, _ := time.LoadLocation("Asia/Tashkent")
 
-	// === ENV ===
 	tgToken := os.Getenv("TELEGRAM_APITOKEN")
 	aiKey := os.Getenv("GEMINI_API_KEY")
 
 	if tgToken == "" || aiKey == "" {
-		log.Fatal("❌ Tokenlar topilmadi (ENV)")
+		log.Fatal("Tokenlar topilmadi")
 	}
 
+	// === SQLite ===
+	db, err := sql.Open("sqlite3", "bot.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	db.Exec(`
+	CREATE TABLE IF NOT EXISTS reminders (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		chat_id INTEGER,
+		fire_at INTEGER,
+		task TEXT
+	)`)
+
 	// === Telegram bot ===
-	bot, err := telebot.NewBot(telebot.Settings{
+	bot, _ := telebot.NewBot(telebot.Settings{
 		Token:  tgToken,
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
 	})
-	if err != nil {
-		log.Fatal(err)
-	}
 
-	// === Gemini client ===
+	// === Gemini ===
 	ctx := context.Background()
-	aiClient, err := genai.NewClient(ctx, option.WithAPIKey(aiKey))
-	if err != nil {
-		log.Fatal(err)
-	}
+	aiClient, _ := genai.NewClient(ctx, option.WithAPIKey(aiKey))
 	defer aiClient.Close()
-
 	model := aiClient.GenerativeModel("models/gemini-flash-latest")
 
-	// === Button ===
-	menu := &telebot.ReplyMarkup{}
-	btnThanks := menu.Data("Rahmat 👍🏻", "thanks")
-	menu.Inline(menu.Row(btnThanks))
+	// === Tugmalar ===
+	menuConfirm := &telebot.ReplyMarkup{}
+	btnYes := menuConfirm.Data("Ha ✅", "yes")
+	btnNo := menuConfirm.Data("Yo‘q ❌", "no")
+	menuConfirm.Inline(menuConfirm.Row(btnYes, btnNo))
 
 	// === /start ===
 	bot.Handle("/start", func(c telebot.Context) error {
+		args := c.Args()
+		if len(args) == 1 && strings.HasPrefix(args[0], "del_") {
+			id := strings.TrimPrefix(args[0], "del_")
+			db.Exec("DELETE FROM reminders WHERE id = ? AND chat_id = ?", id, c.Chat().ID)
+			return c.Send("🗑 Eslatma o‘chirildi.")
+		}
+
 		return c.Send(
-			"👋 Salom!\n\n"+
-				"Men ⏰ *aqlli eslatma botman*.\n"+
-				"Menga vaqt bilan yozing, men o‘sha vaqtda eslataman.\n\n"+
-				"_Masalan:_\n"+
-				"`12:00 da darsim bor`\n"+
-				"`07:00 da menga uyg'onishni eslatib yubor`",
+			"👋 Salom!\n\nMen ⏰ aqlli eslatma botman.\n\nMisol:\n`12:00 da darsim bor`\n`07:00 da uyg‘onishni eslatib yubor`",
 			telebot.ModeMarkdown,
 		)
 	})
 
-	// === Regex & commands ===
-	timeRe := regexp.MustCompile(`(?i)(\d{1,2})[:.](\d{2})`)
-	commandWords := []string{
-		"eslat", "ayt", "aytgin", "yubor", "bildir", "xabar ber",
-	}
+	// === /kutilayotgan ===
+	bot.Handle("/kutilayotgan", func(c telebot.Context) error {
+		rows, _ := db.Query(
+			"SELECT id, fire_at, task FROM reminders WHERE chat_id = ? ORDER BY fire_at",
+			c.Chat().ID,
+		)
+		defer rows.Close()
 
-	// === Text handler ===
+		var out strings.Builder
+		for rows.Next() {
+			var id int
+			var fireAt int64
+			var task string
+			rows.Scan(&id, &fireAt, &task)
+
+			t := time.Unix(fireAt, 0).In(loc).Format("15:04")
+			link := fmt.Sprintf("https://t.me/%s?start=del_%d", bot.Me.Username, id)
+
+			out.WriteString(fmt.Sprintf(
+				"🕒 %s — %s → [o‘chirish](%s)\n",
+				t, task, link,
+			))
+		}
+
+		if out.Len() == 0 {
+			return c.Send("🙂 Sizda hozircha kutilayotgan eslatmalar yo‘q.")
+		}
+
+		return c.Send(
+			"*Kutilayotgan eslatmalar:*\n\n"+out.String(),
+			telebot.ModeMarkdown,
+		)
+	})
+
+	timeRe := regexp.MustCompile(`(\d{1,2}):(\d{2})`)
+	commands := []string{"eslat", "ayt", "yubor", "bildir"}
+
 	bot.Handle(telebot.OnText, func(c telebot.Context) error {
 		text := strings.ToLower(strings.TrimSpace(c.Text()))
-
-		match := timeRe.FindStringSubmatch(text)
-		if len(match) != 3 {
-			return c.Send(
-				"🙂 Iltimos, vaqtni ham yozing.\nMasalan: `07:00 da uyg'onish`",
-				telebot.ModeMarkdown,
-			)
+		m := timeRe.FindStringSubmatch(text)
+		if len(m) != 3 {
+			return c.Send("🙂 Iltimos, vaqtni ham yozing. Masalan: `12:00 da darsim bor`")
 		}
 
-		hour, _ := strconv.Atoi(match[1])
-		minute, _ := strconv.Atoi(match[2])
-
-		hasCommand := false
-		for _, w := range commandWords {
-			if strings.Contains(text, w) {
-				hasCommand = true
-				break
-			}
-		}
-
-		var task string
-
-		// === AI ishlaydigan holat ===
-		if hasCommand {
-			prompt := fmt.Sprintf(`
-Foydalanuvchi xabari: "%s"
-
-Faqat JSON qaytar:
-{"time":"HH:mm","task":"1-3 so‘zli qisqa vazifa"}
-`, text)
-
-			resp, err := model.GenerateContent(ctx, genai.Text(prompt))
-			if err != nil {
-				if strings.Contains(err.Error(), "429") {
-					return c.Send("⚠️ AI limiti vaqtincha tugagan.")
-				}
-				log.Println("AI ERROR:", err)
-				return c.Send("⚠️ AI xatosi.")
-			}
-
-			raw := fmt.Sprint(resp.Candidates[0].Content.Parts[0])
-			raw = strings.Trim(raw, "` \njson")
-
-			var ai AIResponse
-			if err := json.Unmarshal([]byte(raw), &ai); err != nil {
-				return c.Send("⚠️ AI javobini tushunmadim.")
-			}
-
-			task = ai.Task
-		} else {
-			// === Oddiy eslatma (AI YO‘Q) ===
-			task = strings.TrimSpace(timeRe.ReplaceAllString(text, ""))
-			task = strings.ReplaceAll(task, "soat", "")
-			reDa := regexp.MustCompile(`\bda\b`)
-			task = reDa.ReplaceAllString(task, "")
-			task = strings.Join(strings.Fields(task), " ")
-		}
-
-		if task == "" {
-			task = "Eslatma vaqti bo‘ldi"
-		}
+		h, _ := strconv.Atoi(m[1])
+		min, _ := strconv.Atoi(m[2])
 
 		now := time.Now().In(loc)
-		fire := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, loc)
+		fire := time.Date(now.Year(), now.Month(), now.Day(), h, min, 0, 0, loc)
+
 		if fire.Before(now) {
-			fire = fire.Add(24 * time.Hour)
+			pending[c.Chat().ID] = PendingConfirm{
+				ChatID: c.Chat().ID,
+				Time:   fmt.Sprintf("%02d:%02d", h, min),
+				Text:   text,
+			}
+			return c.Send(
+				"⚠️ Bu vaqt allaqachon o‘tib ketgan.\nErtaga shu vaqtda eslataymi?",
+				menuConfirm,
+			)
 		}
 
-		c.Send(fmt.Sprintf(
-			"✅ Eslatma qo‘shildi\n🕒 %02d:%02d\n📝 %s",
-			hour, minute, task,
-		))
+		task := extractTask(text, commands, model, ctx)
 
-		go func(chatID int64, d time.Duration, msg string) {
-			time.Sleep(d)
-			now := time.Now().In(loc)
-			bot.Send(
-				telebot.ChatID(chatID),
-				"🔔 *ESLATMA!*\n"+
-					msg+"\n"+
-					"soat "+now.Format("15:04")+" bo‘ldi",
-				menu,
-				telebot.ModeMarkdown,
-			)
-		}(c.Chat().ID, time.Until(fire), task)
+		db.Exec(
+			"INSERT INTO reminders(chat_id, fire_at, task) VALUES(?,?,?)",
+			c.Chat().ID,
+			fire.Unix(),
+			task,
+		)
 
-		return nil
+		go schedule(bot, c.Chat().ID, fire, task, db)
+
+		return c.Send(fmt.Sprintf("✅ Eslatma qo‘shildi\n🕒 %02d:%02d\n📝 %s", h, min, task))
 	})
 
-	bot.Handle(&btnThanks, func(c telebot.Context) error {
-		return c.Edit("😊 Arzimaydi, yordam berganimdan xursandman!")
+	bot.Handle(&btnYes, func(c telebot.Context) error {
+		p, ok := pending[c.Chat().ID]
+		if !ok {
+			return c.Respond()
+		}
+
+		delete(pending, c.Chat().ID)
+
+		tp := strings.Split(p.Time, ":")
+		h, _ := strconv.Atoi(tp[0])
+		m, _ := strconv.Atoi(tp[1])
+
+		now := time.Now().In(loc)
+		fire := time.Date(now.Year(), now.Month(), now.Day()+1, h, m, 0, 0, loc)
+
+		task := extractTask(p.Text, commands, model, ctx)
+
+		db.Exec(
+			"INSERT INTO reminders(chat_id, fire_at, task) VALUES(?,?,?)",
+			c.Chat().ID,
+			fire.Unix(),
+			task,
+		)
+
+		go schedule(bot, c.Chat().ID, fire, task, db)
+
+		return c.Edit("👍 Yaxshi, ertaga eslataman.")
 	})
 
-	// === START BOT ===
+	bot.Handle(&btnNo, func(c telebot.Context) error {
+		delete(pending, c.Chat().ID)
+		return c.Edit("🙂 Mayli, bekor qilindi.")
+	})
+
+	// === HTTP server (Render uchun) ===
+	go func() {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+			w.Write([]byte("OK"))
+		})
+		http.ListenAndServe(":"+port, nil)
+	}()
+
 	log.Println("🤖 Bot ishga tushdi")
-	go bot.Start()
+	bot.Start()
+}
 
-	// === HTTP SERVER (Render Web Service uchun) ===
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+func extractTask(text string, commands []string, model *genai.GenerativeModel, ctx context.Context) string {
+	for _, c := range commands {
+		if strings.Contains(text, c) {
+			prompt := fmt.Sprintf(
+				`Faqat JSON qaytar: {"task":"qisqa vazifa"}\nMatn: "%s"`,
+				text,
+			)
+			resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+			if err == nil {
+				raw := fmt.Sprint(resp.Candidates[0].Content.Parts[0])
+				raw = strings.Trim(raw, "` \njson")
+				var a AIResponse
+				if json.Unmarshal([]byte(raw), &a) == nil {
+					return a.Task
+				}
+			}
+		}
 	}
+	t := timeRe.ReplaceAllString(text, "")
+	t = strings.ReplaceAll(t, "soat", "")
+	reDa := regexp.MustCompile(`\bda\b`)
+	t = reDa.ReplaceAllString(t, "")
+	return strings.Join(strings.Fields(t), " ")
+}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-
-	log.Println("🌐 HTTP server ishga tushdi, port:", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+func schedule(bot *telebot.Bot, chatID int64, fire time.Time, task string, db *sql.DB) {
+	time.Sleep(time.Until(fire))
+	bot.Send(telebot.ChatID(chatID),
+		fmt.Sprintf("🔔 ESLATMA!\n%s\nsoat %s bo‘ldi",
+			task,
+			time.Now().Format("15:04"),
+		),
+	)
+	db.Exec("DELETE FROM reminders WHERE chat_id = ? AND fire_at = ?", chatID, fire.Unix())
 }
 
