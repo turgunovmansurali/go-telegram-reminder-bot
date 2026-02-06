@@ -20,29 +20,22 @@ import (
 )
 
 type AIResponse struct {
-	Time string `json:"time"`
 	Task string `json:"task"`
 }
 
-type Reminder struct {
-	ID     int
-	ChatID int64
-	Time   string
-	Task   string
-	FireAt time.Time
-}
-
 var (
-	db      *sql.DB
-	timeRe  = regexp.MustCompile(`(?i)(\d{1,2})[:.](\d{2})`)
-	loc, _  = time.LoadLocation("Asia/Tashkent")
-	ctx     = context.Background()
+	db     *sql.DB
+	loc, _ = time.LoadLocation("Asia/Tashkent")
+
+	timeRe = regexp.MustCompile(`(?i)(\d{1,2})[:.](\d{2})`)
+	ctx    = context.Background()
+
 	menu    = &telebot.ReplyMarkup{}
 	btnList = menu.Text("📋 Kutilayotgan")
 )
 
 func main() {
-	// ==== ENV ====
+	// ===== ENV =====
 	tgToken := os.Getenv("TELEGRAM_APITOKEN")
 	aiKey := os.Getenv("GEMINI_API_KEY")
 	port := os.Getenv("PORT")
@@ -54,7 +47,7 @@ func main() {
 		log.Fatal("❌ Tokenlar topilmadi")
 	}
 
-	// ==== SQLITE ====
+	// ===== SQLITE =====
 	var err error
 	db, err = sql.Open("sqlite3", "./reminders.db")
 	if err != nil {
@@ -62,7 +55,7 @@ func main() {
 	}
 	initDB()
 
-	// ==== TELEGRAM BOT ====
+	// ===== BOT =====
 	bot, err := telebot.NewBot(telebot.Settings{
 		Token:  tgToken,
 		Poller: &telebot.LongPoller{Timeout: 10 * time.Second},
@@ -73,12 +66,12 @@ func main() {
 
 	menu.Reply(menu.Row(btnList))
 
-	// ==== GEMINI ====
+	// ===== GEMINI =====
 	aiClient, _ := genai.NewClient(ctx, option.WithAPIKey(aiKey))
 	defer aiClient.Close()
 	model := aiClient.GenerativeModel("models/gemini-flash-latest")
 
-	// ==== START ====
+	// ===== START =====
 	bot.Handle("/start", func(c telebot.Context) error {
 		return c.Send(
 			"👋 Salom!\n\n"+
@@ -90,7 +83,7 @@ func main() {
 		)
 	})
 
-	// ==== KUTILAYOTGAN (tugma + buyruq) ====
+	// ===== KUTILAYOTGAN =====
 	bot.Handle(&btnList, func(c telebot.Context) error {
 		return showPending(c)
 	})
@@ -98,7 +91,7 @@ func main() {
 		return showPending(c)
 	})
 
-	// ==== ASOSIY HANDLER ====
+	// ===== ASOSIY MATN =====
 	commandWords := []string{"eslat", "ayt", "yubor", "bildir", "xabar"}
 
 	bot.Handle(telebot.OnText, func(c telebot.Context) error {
@@ -115,6 +108,7 @@ func main() {
 		now := time.Now().In(loc)
 		fire := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, loc)
 
+		// ==== O‘TIB KETGAN VAQT ====
 		if fire.Before(now) {
 			yesNo := &telebot.ReplyMarkup{}
 			btnYes := yesNo.Data("Ha", "tomorrow_yes", text)
@@ -122,41 +116,51 @@ func main() {
 			yesNo.Inline(yesNo.Row(btnYes, btnNo))
 
 			return c.Send(
-				"⚠️ Bu vaqt allaqachon o‘tib ketgan.\n"+
-					"Ertaga shu vaqtda eslataymi?",
+				"⚠️ Bu vaqt allaqachon o‘tib ketgan.\nErtaga shu vaqtda eslataymi?",
 				yesNo,
 			)
 		}
 
-		task := cleanTask(text, commandWords, model, aiKey)
+		task := cleanTask(text, commandWords, model)
 		saveReminder(c.Chat().ID, task, fire)
 
-		c.Send(fmt.Sprintf("✅ Eslatma qo‘shildi\n🕒 %02d:%02d\n📝 %s", h, m, task), menu)
-		return nil
+		return c.Send(
+			fmt.Sprintf("✅ Eslatma qo‘shildi\n🕒 %02d:%02d\n📝 %s", h, m, task),
+			menu,
+		)
 	})
 
-	// ==== ERTAGA HA ====
-	bot.Handle(telebot.OnCallback, func(c telebot.Context) error {
-		if c.Callback().Unique() != "tomorrow_yes" {
-			return c.Respond()
+	// ===== CALLBACK: ERTAGA HA =====
+	bot.Handle(&telebot.Callback{Unique: "tomorrow_yes"}, func(c telebot.Context) error {
+		text := c.Callback().Data
+
+		match := timeRe.FindStringSubmatch(text)
+		if len(match) != 3 {
+			return c.Edit("❌ Vaqtni aniqlab bo‘lmadi")
 		}
 
-		text := c.Callback().Data
-		match := timeRe.FindStringSubmatch(text)
 		h, _ := strconv.Atoi(match[1])
 		m, _ := strconv.Atoi(match[2])
 
-		now := time.Now().In(loc)
-		fire := time.Date(now.Year(), now.Month(), now.Day()+1, h, m, 0, 0, loc)
+		fire := time.Date(
+			time.Now().In(loc).Year(),
+			time.Now().In(loc).Month(),
+			time.Now().In(loc).Day()+1,
+			h, m, 0, 0, loc,
+		)
 
-		task := cleanTask(text, []string{"eslat", "ayt", "yubor"}, nil, "")
+		task := cleanTask(text, []string{"eslat", "ayt", "yubor"}, nil)
 		saveReminder(c.Chat().ID, task, fire)
 
-		c.Edit("✅ Eslatma ertangi kunga qo‘shildi")
-		return nil
+		return c.Edit("✅ Eslatma ertangi kunga qo‘shildi")
 	})
 
-	// ==== HTTP SERVER (RENDER UCHUN) ====
+	// ===== CALLBACK: YO‘Q =====
+	bot.Handle(&telebot.Callback{Unique: "tomorrow_no"}, func(c telebot.Context) error {
+		return c.Edit("❎ Eslatma bekor qilindi")
+	})
+
+	// ===== HTTP (RENDER) =====
 	go func() {
 		http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 			w.Write([]byte("OK"))
@@ -165,14 +169,14 @@ func main() {
 		http.ListenAndServe(":"+port, nil)
 	}()
 
-	// ==== WORKER ====
+	// ===== WORKER =====
 	go reminderWorker(bot)
 
 	log.Println("🤖 Bot ishga tushdi")
 	bot.Start()
 }
 
-// ================= HELPERS =================
+// ================= DB =================
 
 func initDB() {
 	db.Exec(`
@@ -190,6 +194,8 @@ func saveReminder(chatID int64, task string, fire time.Time) {
 		chatID, task, fire)
 }
 
+// ================= WORKER =================
+
 func reminderWorker(bot *telebot.Bot) {
 	for {
 		rows, _ := db.Query(`SELECT id, chat_id, task FROM reminders WHERE fire_at <= ?`,
@@ -200,7 +206,8 @@ func reminderWorker(bot *telebot.Bot) {
 			var task string
 			rows.Scan(&id, &chatID, &task)
 
-			bot.Send(telebot.ChatID(chatID),
+			bot.Send(
+				telebot.ChatID(chatID),
 				fmt.Sprintf("🔔 *ESLATMA!*\n%s\n_soat %s bo‘ldi_",
 					task, time.Now().Format("15:04")),
 				menu,
@@ -212,9 +219,13 @@ func reminderWorker(bot *telebot.Bot) {
 	}
 }
 
+// ================= LIST =================
+
 func showPending(c telebot.Context) error {
-	rows, _ := db.Query(`SELECT id, task, fire_at FROM reminders WHERE chat_id=? ORDER BY fire_at`,
-		c.Chat().ID)
+	rows, _ := db.Query(
+		`SELECT id, task, fire_at FROM reminders WHERE chat_id=? ORDER BY fire_at`,
+		c.Chat().ID,
+	)
 	defer rows.Close()
 
 	msg := "📋 *Kutilayotgan bildirishnomalar:*\n\n"
@@ -238,18 +249,21 @@ func showPending(c telebot.Context) error {
 	return c.Send(msg, menu, telebot.ModeMarkdown)
 }
 
-func cleanTask(text string, cmds []string, model *genai.GenerativeModel, key string) string {
+// ================= TASK CLEAN =================
+
+func cleanTask(text string, cmds []string, model *genai.GenerativeModel) string {
 	for _, w := range cmds {
 		if strings.Contains(text, w) && model != nil {
-			prompt := fmt.Sprintf(`JSON qaytar:
-{"task":"qisqa"}
-Matn: "%s"`, text)
-			resp, _ := model.GenerateContent(ctx, genai.Text(prompt))
-			raw := fmt.Sprint(resp.Candidates[0].Content.Parts[0])
-			raw = strings.Trim(raw, "` \njson")
-			var ai AIResponse
-			json.Unmarshal([]byte(raw), &ai)
-			return ai.Task
+			prompt := fmt.Sprintf(`{"task":"qisqa"}\nMatn: "%s"`, text)
+			resp, err := model.GenerateContent(ctx, genai.Text(prompt))
+			if err == nil && len(resp.Candidates) > 0 {
+				raw := fmt.Sprint(resp.Candidates[0].Content.Parts[0])
+				raw = strings.Trim(raw, "` \njson")
+				var ai AIResponse
+				if json.Unmarshal([]byte(raw), &ai) == nil {
+					return ai.Task
+				}
+			}
 		}
 	}
 
